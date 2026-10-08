@@ -7,7 +7,7 @@
 让**整个局域网**——手机、平板、电脑、电视盒子——无需安装任何客户端即可访问 GitHub
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.4.4-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.4.5-green.svg)](CHANGELOG.md)
 [![Architecture](https://img.shields.io/badge/arch-all-lightgrey.svg)](#四架构兼容性)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-21.02%2B-orange.svg)](#四架构兼容性)
 
@@ -82,23 +82,56 @@
 从 [Releases](../../releases) 下载 `ghacc_x.y.z_all.ipk`：
 
 ```sh
-scp ghacc_2.4.4_all.ipk root@192.168.2.1:/tmp/
-ssh root@192.168.2.1 "opkg install /tmp/ghacc_2.4.4_all.ipk"
+scp ghacc_2.4.5_all.ipk root@192.168.2.1:/tmp/
+ssh root@192.168.2.1 "opkg install /tmp/ghacc_2.4.5_all.ipk"
 ```
 
 > 把 `192.168.2.1` 换成你路由器的地址。
 
 装完打开 LuCI：**服务 → GitHub 加速**。
 
-### 方式 2：源码安装
+### 方式 2：路由器上直接安装（无需电脑中转）
+
+SSH 登录你的路由器，然后复制粘贴以下**任意一条**命令即可。
+
+#### 2a. 一条命令装最新版（推荐）
 
 ```sh
-scp -r . root@192.168.2.1:/tmp/luci-app-ghacc
-ssh root@192.168.2.1 "sh /tmp/luci-app-ghacc/install.sh"
+cd /tmp && curl -fsSL https://raw.githubusercontent.com/sqchr888/luci-app-ghacc/main/install.sh | sh
 ```
+
+> 该命令会从仓库拉取安装脚本并执行。脚本会先做环境体检，
+> 再自动下载最新 Release 的 ipk 并安装。
+
+#### 2b. 指定版本 / 从 Release 直装
+
+```sh
+cd /tmp && curl -fsSL -o ghacc.ipk \
+  https://github.com/sqchr888/luci-app-ghacc/releases/latest/download/ghacc_2.4.5_all.ipk \
+  && opkg install ghacc.ipk
+```
+
+#### 2c. 拉取完整源码后手动安装
+
+```sh
+cd /tmp && rm -rf luci-app-ghacc
+curl -fsSL https://github.com/sqchr888/luci-app-ghacc/archive/refs/heads/main.tar.gz \
+  | tar xz && mv luci-app-ghacc-main luci-app-ghacc
+sh /tmp/luci-app-ghacc/install.sh
+```
+
+> 如果你的路由器装有 `git`，也可以用：
+> ```sh
+> cd /tmp && git clone --depth 1 https://github.com/sqchr888/luci-app-ghacc.git
+> sh /tmp/luci-app-ghacc/install.sh
+> ```
 
 安装脚本会先做环境体检（固件 / 架构 / curl 版本 / dnsmasq 实例 / overlay 剩余空间），
 再装文件、语法自检、启动。
+
+> **提示**：若 `raw.githubusercontent.com` 或 `github.com` 在你的线路上不可达，
+> 说明此时正处于封锁窗口，可稍后重试，或改用上面的「方式 1」从电脑上传 ipk
+> （电脑侧通常有代理/加速手段）。
 
 ### 依赖
 
@@ -229,6 +262,7 @@ ghacc-uninstall              # 推荐：七步清理，幂等
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `STRICT_MAIN_SITE` | 1 | 对 `github.com` 主站额外做正文校验 |
+| `STRICT_API` | 1 | **v2.4.5** 对 `api.github.com` 校验返回 JSON，识别「证书合法但服务不对」的 IP |
 | `MIN_BODY_SIZE` | 5000 | 主站正文体积下限（字节） |
 | `BODY_MARKER` | github | 主站正文必须含有的特征串 |
 

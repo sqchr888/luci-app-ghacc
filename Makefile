@@ -19,7 +19,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ghacc
-PKG_VERSION:=2.4.4
+PKG_VERSION:=2.4.5
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=sqchr888 <sqchr888@users.noreply.github.com>

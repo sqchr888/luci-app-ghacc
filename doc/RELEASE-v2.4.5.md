@@ -1,4 +1,4 @@
-# ghacc v2.4.4
+# ghacc v2.4.5
 
 OpenWrt 上的 GitHub 实时加速守护进程（带 LuCI 管理界面）。
 让**整个局域网**——手机、电脑、电视盒子——无需安装任何客户端即可访问 GitHub。
@@ -11,8 +11,8 @@ OpenWrt 上的 GitHub 实时加速守护进程（带 LuCI 管理界面）。
 
 ```sh
 # 下载附件中的 ipk 后传到路由器
-scp ghacc_2.4.4_all.ipk root@192.168.2.1:/tmp/
-ssh root@192.168.2.1 "opkg install /tmp/ghacc_2.4.4_all.ipk"
+scp ghacc_2.4.5_all.ipk root@192.168.2.1:/tmp/
+ssh root@192.168.2.1 "opkg install /tmp/ghacc_2.4.5_all.ipk"
 ```
 
 装完打开 LuCI：**服务 → GitHub 加速**
@@ -22,42 +22,44 @@ ssh root@192.168.2.1 "opkg install /tmp/ghacc_2.4.4_all.ipk"
 ### 校验下载文件
 
 ```sh
-sha256sum ghacc_2.4.4_all.ipk
+sha256sum ghacc_2.4.5_all.ipk
 # 应输出：
-# f50274b4e762c41da061a9cd8a84ea15184975747ca22fe9cbd26bfdff149ee2
+# cdd426dd8dffb56101bd4f5ea36127f1c6898f33e02459c984d2151a2644a774
 ```
 
 ---
 
 ## ✨ 本次更新要点
 
-### 修复：健康判据误杀非网页域名
+### 修复：证书合法但服务不对的 IP 会被误判为可用
 
-部分受管域名（`objects.githubusercontent.com`、`avatars.githubusercontent.com`、
-`api.github.com`）访问根路径必然返回 404 或极短正文 —— 这与 IP 好坏无关，
-但旧判据会把它们持续判为不可用，日志反复刷"无可用 IP"。
+GitHub 多个子域共用 `*.github.com` 通配证书，所以「证书校验通过」只证明
+对面是 GitHub 的某台服务器，**不证明它提供的是该子域应有的服务**。
 
-**现在改为以 TLS 证书为准**：
+实测案例：`api.github.com` 被解析到一个证书完全合法（`ssl_verify_result=0`）
+但不提供 API 服务的 IP —— 访问根路径返回 301 跳转到 `github.com`。
+这会让所有依赖 `api.github.com` 的工具（`gh` CLI、CI、各类客户端）失败，
+而守护进程却认为该 IP 健康。
 
+现在对能定义「正确响应」的域名追加服务特征校验：
+**`api.github.com` 根路径必须返回 200 且正文为 JSON**。新增开关 `STRICT_API`。
+
+### 新增：无需电脑中转，路由器上一条命令安装
+
+```sh
+cd /tmp && curl -fsSL https://raw.githubusercontent.com/sqchr888/luci-app-ghacc/main/install.sh | sh
 ```
-curl 退出码 == 0  且  ssl_verify_result == 0   →  通过
-```
 
-真实 GitHub 证书由公共 CA 签发且域名匹配；冒牌 IP 要么证书链不可信、
-要么域名不匹配。**而 404 / 302 / 空正文都发生在 TLS 之后，不再影响判定。**
+脚本会自动判断运行模式：管道执行时走「在线安装」（优先取 Release 的 ipk，
+失败则回退到拉取源码 tarball）；检测到同目录有源码时走「本地源码」安装。
 
-### 修复：探测请求方式
+### 修复：源码安装现在会一并装 LuCI 界面
 
-部分域名（如 `objects.githubusercontent.com`）**不响应 `HEAD` 请求**，
-会挂起直到超时。改用 `curl -r 0-0`（GET 且只取首个字节），避免误判可用 IP。
-
-### 改进：候选池优先级
-
-候选来源中，GitHub520 与 DoH 是持续维护/实时的，而代码内置的 IP 池是静态快照。
-此前三者合并后按字典序截断，会导致陈旧 IP 挤占名额。现在**新鲜来源优先**，
-内置池仅补足剩余位置。
+此前源码方式只装了命令行部分，导致 LuCI 菜单不出现。现在会一并安装
+界面文件与 UCI 配置，并归一化权限（LuCI 资源必须 644）。
 
 ---
+
 
 ## 🔧 主要特性
 

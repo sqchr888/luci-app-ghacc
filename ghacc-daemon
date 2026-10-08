@@ -48,10 +48,12 @@ CONF=/etc/ghacc/ghacc.conf
 : "${CYCLE_GUARD:=300}"        # 单轮循环最长耗时（秒），超时强制进入下一轮
 
 # ---- v2.4 健康判据参数 ----
-# 详见 verify_ip() 的注释。这两个值的作用是挡掉"状态码看着正常、
-# 实际不是 GitHub"的假 IP（4 字节 OK / 400 Bad request 页）。
+# 详见 verify_ip() 的注释。这些值的作用是挡掉"看着正常、实际不是该服务"
+# 的假 IP（4 字节 OK / 400 Bad request 页 / 证书合法但服务不对）。
 : "${MIN_BODY_SIZE:=5000}"     # 正文体积下限（字节）；真 GitHub 首页约 29 万+
 : "${BODY_MARKER:=github}"     # 正文必须含有的特征串（不区分大小写）
+: "${STRICT_MAIN_SITE:=1}"     # 对 github.com 主站做正文校验
+: "${STRICT_API:=1}"           # 对 api.github.com 校验返回 JSON（v2.4.5 新增）
 # DNS 自愈校验（B2）：问本机 dnsmasq 一个探针域名，确认它真的解析到了
 # 我们写入的 IP。用于发现"drop-in 文件在、但 dnsmasq 没加载"的静默失效。
 # 置空则关闭该校验。
@@ -267,6 +269,42 @@ verify_ip() {
     # ssl_verify_result 必须是 0（证书链可信 + 域名匹配）
     case "$_sr" in ''|*[!0-9]*) return 1 ;; esac
     [ "$_sr" -eq 0 ] || return 1
+
+    # ---- 按域名做「服务类型」校验（v2.4.5 新增）----
+    #
+    # 为什么证书校验还不够：GitHub 的多个子域共用同一张通配证书
+    # （*.github.com），所以「证书合法」只证明**对面是 GitHub 的某台服务器**，
+    # 不证明它提供的是**该子域应有的服务**。
+    #
+    # 实测案例：api.github.com 被解析到 140.82.116.3 时，证书校验完全通过
+    # （ssl_verify_result=0），但该 IP 上跑的不是 API 服务 —— 访问根路径
+    # 返回 301 跳转到 github.com。所有依赖 api.github.com 的工具
+    # （gh CLI、CI、各类客户端）都会因此失败，而守护进程却认为它健康。
+    #
+    # 因此对能明确定义"正确响应"的域名，额外校验服务特征：
+    #   api.github.com  -> 根路径必须返回 JSON（以 { 或 [ 开头）
+    # 其余域名（codeload/raw 走 301、objects 走 404、avatars 走 302）
+    # 的根路径响应本就多样，不做内容强校验，仅凭证书判定。
+    case "$_d" in
+        api.github.com)
+            [ "${STRICT_API:-1}" = "1" ] || return 0
+            _body="$STATE_DIR/.verify.$$"
+            _r=$(curl --noproxy '*' -s -m "$PROBE_TIMEOUT" \
+                 --resolve "$_d:443:$_ip" \
+                 -o "$_body" -w '%{http_code}' \
+                 "https://$_d/" 2>/dev/null)
+            _code=$_r
+            # GitHub API 根路径必须是 200 且正文是 JSON
+            if [ "$_code" != "200" ]; then
+                rm -f "$_body"; return 1
+            fi
+            case "$(head -c 1 "$_body" 2>/dev/null)" in
+                '{'|'[') : ;;                      # 是 JSON，通过
+                *) rm -f "$_body"; return 1 ;;
+            esac
+            rm -f "$_body"
+            ;;
+    esac
 
     # ---- 对 github.com 主站额外做正文校验 ----
     # 主站是真正的网页，可以用体积与特征串再加一道保险，

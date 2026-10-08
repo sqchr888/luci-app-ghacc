@@ -4,6 +4,42 @@
 
 ---
 
+## [2.4.5] - 2026-10-08
+
+### 修复
+
+- **证书合法但服务不对的 IP 会被误判为可用**：
+  GitHub 多个子域共用 `*.github.com` 通配证书，因此「证书校验通过」只证明
+  对面是 GitHub 的某台服务器，**不证明它提供的是该子域应有的服务**。
+
+  实测案例：`api.github.com` 被解析到一个证书完全合法（`ssl_verify_result=0`）
+  但不提供 API 服务的 IP —— 访问根路径返回 301 跳转到 `github.com`。
+  这会导致所有依赖 `api.github.com` 的工具（`gh` CLI、CI、各类客户端）失败，
+  而守护进程却认为该 IP 健康。
+
+  现在对能明确定义「正确响应」的域名追加服务特征校验：
+  **`api.github.com` 根路径必须返回 200 且正文为 JSON**（以 `{` 或 `[` 开头）。
+  新增开关 `STRICT_API`（默认 `1`）。
+
+### 新增
+
+- **`install.sh` 支持从仓库一键安装**，无需电脑中转：
+  ```sh
+  cd /tmp && curl -fsSL https://raw.githubusercontent.com/sqchr888/luci-app-ghacc/main/install.sh | sh
+  ```
+  脚本会自动判断运行模式：管道执行时走「在线安装」（优先取 Release 的 ipk，
+  失败则回退到拉取源码 tarball）；检测到同目录有源码时走「本地源码」安装。
+- **源码安装现在会一并安装 LuCI 界面与 UCI 配置**
+  （此前只装了命令行部分，导致界面菜单不出现）。
+- 安装完成后提示验证解析是否真正生效。
+
+### 修复（安装脚本）
+
+- **`set -u` 下 `$VAR` 紧跟中文全角字符会被当作变量名的一部分**，
+  触发 `unbound variable` 而中止。已改为统一使用 `${VAR}` 包裹。
+
+---
+
 ## [2.4.4] - 2026-10-08
 
 ### 修复
@@ -177,6 +213,7 @@
 
 ---
 
+[2.4.5]: https://github.com/sqchr888/luci-app-ghacc/releases/tag/v2.4.5
 [2.4.4]: https://github.com/sqchr888/luci-app-ghacc/releases/tag/v2.4.4
 [2.4.3]: https://github.com/sqchr888/luci-app-ghacc/releases/tag/v2.4.3
 [2.4.2]: https://github.com/sqchr888/luci-app-ghacc/releases/tag/v2.4.2

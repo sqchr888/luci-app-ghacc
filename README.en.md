@@ -8,7 +8,7 @@ Give **every device on your LAN** — phones, tablets, computers, TV boxes — a
 with no client software and no per-device configuration.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.4.4-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.4.5-green.svg)](CHANGELOG.md)
 [![Architecture](https://img.shields.io/badge/arch-all-lightgrey.svg)](#4-architecture-compatibility)
 [![OpenWrt](https://img.shields.io/badge/OpenWrt-21.02%2B-orange.svg)](#4-architecture-compatibility)
 
@@ -87,23 +87,56 @@ have drawbacks:
 Download `ghacc_x.y.z_all.ipk` from [Releases](../../releases):
 
 ```sh
-scp ghacc_2.4.4_all.ipk root@192.168.2.1:/tmp/
-ssh root@192.168.2.1 "opkg install /tmp/ghacc_2.4.4_all.ipk"
+scp ghacc_2.4.5_all.ipk root@192.168.2.1:/tmp/
+ssh root@192.168.2.1 "opkg install /tmp/ghacc_2.4.5_all.ipk"
 ```
 
 > Replace `192.168.2.1` with your router's address.
 
 Then open LuCI: **Services → GitHub Accelerator**.
 
-### Option B: from source
+### Option B: install directly on the router (no PC needed)
+
+SSH into your router and paste **any one** of the following.
+
+#### B-a. One-liner, latest version (recommended)
 
 ```sh
-scp -r . root@192.168.2.1:/tmp/luci-app-ghacc
-ssh root@192.168.2.1 "sh /tmp/luci-app-ghacc/install.sh"
+cd /tmp && curl -fsSL https://raw.githubusercontent.com/sqchr888/luci-app-ghacc/main/install.sh | sh
 ```
+
+> This fetches the installer from the repository and runs it. The script performs a
+> pre-flight check, then downloads and installs the latest release automatically.
+
+#### B-b. Specific version / straight from Releases
+
+```sh
+cd /tmp && curl -fsSL -o ghacc.ipk \
+  https://github.com/sqchr888/luci-app-ghacc/releases/latest/download/ghacc_2.4.5_all.ipk \
+  && opkg install ghacc.ipk
+```
+
+#### B-c. Fetch the full source tree, then install
+
+```sh
+cd /tmp && rm -rf luci-app-ghacc
+curl -fsSL https://github.com/sqchr888/luci-app-ghacc/archive/refs/heads/main.tar.gz \
+  | tar xz && mv luci-app-ghacc-main luci-app-ghacc
+sh /tmp/luci-app-ghacc/install.sh
+```
+
+> If your router has `git` installed, you can also use:
+> ```sh
+> cd /tmp && git clone --depth 1 https://github.com/sqchr888/luci-app-ghacc.git
+> sh /tmp/luci-app-ghacc/install.sh
+> ```
 
 The install script runs a pre-flight check (firmware / architecture / curl version /
 dnsmasq instances / free overlay space) before installing, syntax-checking, and starting.
+
+> **Note**: if `raw.githubusercontent.com` or `github.com` is unreachable on your line,
+> you're in a block window — retry later, or use Option A to upload the `.ipk` from your
+> computer (which may have a proxy available).
 
 ### Dependencies
 
@@ -243,6 +276,7 @@ Config file: `/etc/ghacc/ghacc.conf` (or edit via LuCI, which regenerates it on 
 | Option | Default | Description |
 |---|---|---|
 | `STRICT_MAIN_SITE` | 1 | Extra body validation for the `github.com` main site |
+| `STRICT_API` | 1 | **v2.4.5** Validate that `api.github.com` returns JSON — catches IPs with a valid cert but the wrong service |
 | `MIN_BODY_SIZE` | 5000 | Minimum body size for the main site (bytes) |
 | `BODY_MARKER` | github | Required substring in the main site's body |
 

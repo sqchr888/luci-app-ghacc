@@ -1,5 +1,5 @@
 Package: ghacc
-Version: 2.4.4
+Version: 2.4.5
 Depends: libc, curl, ca-certificates
 Source: https://github.com/sqchr888/luci-app-ghacc
 Section: net
