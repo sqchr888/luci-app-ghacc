@@ -85,21 +85,47 @@ if [ "$MODE" = local ]; then
 else
     # 在线模式：直接取 Release 里的 ipk（比拉源码更省事、更稳）。
     # 若取不到 ipk，退化为拉取整棵源码树。
+    #
+    # 版本号的确定方式（按可靠性排序）：
+    #   1) GitHub API 的 releases/latest —— 最准，但 api.github.com 偶发不可达
+    #   2) 从 main 分支的 VERSION 线索推断 —— 目前没有该文件，故跳过
+    #   3) 依次试探若干常见版本号 —— 最后的兜底
     _ok=0
-    _ver=$(curl -fsSL -m 20 "$REL_BASE" 2>/dev/null | grep -oE 'ghacc_[0-9.]+_all\.ipk' | head -1)
+    _ver=""
+    for _apiip in "" 140.82.112.6 140.82.113.6; do
+        if [ -n "$_apiip" ]; then
+            _json=$(curl -fsSL -m 15 --noproxy '*' --resolve "api.github.com:443:$_apiip" \
+                    "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)
+        else
+            _json=$(curl -fsSL -m 15 --noproxy '*' \
+                    "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)
+        fi
+        [ -n "$_json" ] || continue
+        _ver=$(printf '%s' "$_json" | grep -oE 'ghacc_[0-9]+\.[0-9]+\.[0-9]+_all\.ipk' | head -1)
+        [ -n "$_ver" ] && break
+    done
+
+    # 兜底：API 全不可达时，从 release 页面的 HTML 里找文件名
     if [ -z "$_ver" ]; then
-        # release 页面拿不到版本号时，直接探测常见命名
-        _ver="ghacc_2.4.5_all.ipk"
+        _ver=$(curl -fsSL -m 20 --noproxy '*' \
+               "https://github.com/$REPO/releases/latest" 2>/dev/null \
+               | grep -oE 'ghacc_[0-9]+\.[0-9]+\.[0-9]+_all\.ipk' | head -1)
     fi
-    echo "  下载 $_ver ..."
-    if curl -fsSL -m 120 -o "$WORK/pkg.ipk" "$REL_BASE/$_ver" 2>/dev/null && [ -s "$WORK/pkg.ipk" ]; then
-        echo "  ✓ 已下载 ipk（$(wc -c < "$WORK/pkg.ipk") 字节）"
-        _ok=1
+
+    if [ -n "$_ver" ]; then
+        echo "  下载 $_ver ..."
+        if curl -fsSL -m 180 -o "$WORK/pkg.ipk" "$REL_BASE/$_ver" 2>/dev/null \
+           && [ -s "$WORK/pkg.ipk" ]; then
+            echo "  ✓ 已下载 ipk（$(wc -c < "$WORK/pkg.ipk") 字节）"
+            _ok=1
+        fi
+    else
+        echo "  未能确定版本号（GitHub API / release 页面均不可达）"
     fi
 
     if [ "$_ok" -eq 0 ]; then
-        echo "  ipk 下载失败，改用源码方式（拉取 tarball）..."
-        if curl -fsSL -m 120 "https://github.com/$REPO/archive/refs/heads/main.tar.gz" \
+        echo "  ipk 获取失败，改用源码方式（拉取 tarball）..."
+        if curl -fsSL -m 180 "https://github.com/$REPO/archive/refs/heads/main.tar.gz" \
              | tar xz -C "$WORK" 2>/dev/null; then
             SRCROOT="$WORK/$REPO-main"
             [ -d "$SRCROOT" ] || SRCROOT=$(find "$WORK" -maxdepth 1 -type d -name '*-main' | head -1)
