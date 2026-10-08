@@ -1,0 +1,151 @@
+<%+header%>
+
+<h2 name="content"><%:GitHub 加速%></h2>
+
+<fieldset class="cbi-section">
+  <legend><%:运行状态%></legend>
+  <table width="100%" cellspacing="10">
+    <tr>
+      <td width="33%"><%:守护进程%></td>
+      <td>
+        <% if running then %>
+          <span style="color:#5cb85c;font-weight:bold"><%:运行中%></span>
+        <% else %>
+          <span style="color:#d9534f;font-weight:bold"><%:已停止%></span>
+        <% end %>
+      </td>
+    </tr>
+    <tr>
+      <td width="33%"><%:开机自启%></td>
+      <td>
+        <% if enabled then %>
+          <span style="color:#5cb85c"><%:已开启%></span>
+        <% else %>
+          <span style="color:#999"><%:已关闭%></span>
+        <% end %>
+      </td>
+    </tr>
+    <tr>
+      <td width="33%"><%:当前生效 IP%></td>
+      <td><%=#entries%> <%:条%></td>
+    </tr>
+  </table>
+</fieldset>
+
+<%
+-- 按钮可用性由运行状态决定：
+--   运行中 -> 「启动」禁用(灰)，「停止」可用(绿)
+--   已停止 -> 「启动」可用(绿)，「停止」禁用(灰)
+-- 同时用 disabled 属性 + 内联样式，因为不同 LuCI 主题对 disabled 的
+-- 渲染差异很大（有的几乎看不出灰），双重保证视觉一致。
+local function btn_style(on, color)
+  if on then
+    return 'background:' .. color .. ';border-color:' .. color .. ';color:#fff'
+  end
+  return 'opacity:.45;cursor:not-allowed'
+end
+%>
+
+<fieldset class="cbi-section">
+  <legend><%:操作%></legend>
+  <form method="post" action="<%=REQUEST_URI%>" style="display:inline">
+    <input type="hidden" name="action" value="start" />
+    <input type="submit" class="cbi-button"
+           style="<%=btn_style(not running, "#5cb85c")%>"
+           value="<%:启动%>" <% if running then %>disabled="disabled"<% end %> />
+  </form>
+  <form method="post" action="<%=REQUEST_URI%>" style="display:inline">
+    <input type="hidden" name="action" value="stop" />
+    <input type="submit" class="cbi-button"
+           style="<%=btn_style(running, "#5cb85c")%>"
+           value="<%:停止%>" <% if not running then %>disabled="disabled"<% end %> />
+  </form>
+  <form method="post" action="<%=REQUEST_URI%>" style="display:inline">
+    <input type="hidden" name="action" value="restart" />
+    <input type="submit" class="cbi-button"
+           style="<%=btn_style(running, "#337ab7")%>"
+           value="<%:重启%>" <% if not running then %>disabled="disabled"<% end %> />
+  </form>
+  <form method="post" action="<%=REQUEST_URI%>" style="display:inline">
+    <input type="hidden" name="action" value="rescan" />
+    <input type="submit" class="cbi-button"
+           style="<%=btn_style(running, "#337ab7")%>"
+           value="<%:强制重扫 IP%>" <% if not running then %>disabled="disabled"<% end %> />
+  </form>
+  <form method="post" action="<%=REQUEST_URI%>" style="display:inline"
+        onsubmit="return confirm('<%:确定要清空日志吗？此操作不可撤销。%>')">
+    <input type="hidden" name="action" value="clearlog" />
+    <input type="submit" class="cbi-button"
+           style="<%=btn_style(true, "#d9534f")%>"
+           value="<%:清理日志%>" />
+  </form>
+</fieldset>
+
+<fieldset class="cbi-section">
+  <legend><%:当前生效的 hosts 条目%></legend>
+  <% if #entries > 0 then %>
+  <table class="cbi-section-table" width="100%">
+    <tr class="cbi-section-table-titles">
+      <th class="cbi-section-table-cell" style="text-align:left"><%:IP 地址%></th>
+      <th class="cbi-section-table-cell" style="text-align:left"><%:域名%></th>
+    </tr>
+    <% for i, e in ipairs(entries) do %>
+    <tr class="cbi-section-table-row">
+      <td class="cbi-section-table-cell" style="text-align:left"><%=e.ip%></td>
+      <td class="cbi-section-table-cell" style="text-align:left"><%=e.domain%></td>
+    </tr>
+    <% end %>
+  </table>
+  <% elseif running then %>
+  <em><%:守护进程运行中，但尚未探测到可用 IP。%></em>
+  <div style="margin-top:6px;color:#8a6d3b">
+    <small><%:若持续如此，通常是当前线路对 GitHub 全部候选 IP 均不可达（属正常现象，会自动重试）。%></small>
+  </div>
+  <% else %>
+  <em><%:守护进程未运行，暂无条目。请先点击上方「启动」。%></em>
+  <% end %>
+  <div style="margin-top:8px">
+    <small><%:数据来源%>: <code><%=entries_file%></code></small>
+  </div>
+</fieldset>
+
+<fieldset class="cbi-section">
+  <legend><%:最近日志%> <small style="font-weight:normal">(<%:每秒自动刷新%>)</small></legend>
+  <pre id="ghacc-log" style="white-space:pre-wrap;font-size:12px;background:#1e1e1e;color:#d4d4d4;padding:10px;border-radius:4px;max-height:420px;overflow-y:auto;margin:0"><%=pcdata(log)%></pre>
+</fieldset>
+
+<script type="text/javascript">
+//<![CDATA[
+(function() {
+  var LOGURL = '<%=log_url%>';
+  var logEl  = document.getElementById('ghacc-log');
+  var atBottom = true;
+
+  // 用户往上翻看历史时不要强行拽回底部
+  if (logEl) {
+    logEl.addEventListener('scroll', function() {
+      atBottom = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 24;
+    });
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function refreshLog() {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', LOGURL + '?_=' + Date.now(), true);
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== 4 || xhr.status !== 200 || !logEl) return;
+      var txt = xhr.responseText || '';
+      if (logEl.textContent !== txt) {
+        logEl.textContent = txt;
+        if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+      }
+    };
+    xhr.send(null);
+  }
+
+  setInterval(refreshLog, 1000);
+})();
+//]]>
+</script>
+
+<%+footer%>

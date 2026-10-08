@@ -1,0 +1,11 @@
+{
+	"luci-app-ghacc": {
+		"description": "Grant UCI access for luci-app-ghacc",
+		"read": {
+			"uci": [ "ghacc" ]
+		},
+		"write": {
+			"uci": [ "ghacc" ]
+		}
+	}
+}

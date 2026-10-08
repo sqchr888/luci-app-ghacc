@@ -1,0 +1,24 @@
+# ---- macOS ----
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+
+# ---- 构建中间产物 ----
+.build/
+dist/*.ipk
+*.ipk
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+
+# ---- 本地测试与临时文件 ----
+/tmp-test/
+*.log

@@ -1,0 +1,13 @@
+#!/bin/sh
+# 卸载后：清运行时残留与 LuCI 缓存（此时文件已被删除，只清残余物）
+rm -rf /tmp/ghacc          2>/dev/null
+rm -f  /tmp/hosts.ghacc.bak.* 2>/dev/null
+# 移除 dnsmasq conf-dir 的 drop-in（prerm 已停服务；这里兜底防残留）
+rm -f  /tmp/dnsmasq.d/ghacc.conf /etc/dnsmasq.d/ghacc.conf 2>/dev/null
+rm -f  /var/run/ghacc.pid  2>/dev/null
+rm -rf /var/run/ghacc.lock 2>/dev/null
+rm -f  /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+rmdir  /etc/ghacc 2>/dev/null
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1
+exit 0

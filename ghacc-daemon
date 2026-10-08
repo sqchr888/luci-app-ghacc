@@ -1,0 +1,740 @@
+#!/bin/sh
+# ============================================================
+# ghacc-daemon —— OpenWrt 上的 GitHub 实时守护进程（加固版 v2）
+#
+# 与"定时 cron 刷新 hosts"的本质区别：
+#   常驻运行，每 CHECK_INTERVAL 秒探测在用 IP；发现不通则并行重扫候选池、
+#   热切换、SIGHUP 热加载 dnsmasq。从"IP 被封"到"恢复"是秒级而非分钟级。
+#
+# 针对资源占用的四道防线（v2 新增）：
+#   1. Flash 保护   —— hosts 写入有最小间隔 + 脏标记合并，抖动时不会狂写闪存
+#   2. 抖动抑制     —— 连续 FAIL_THRESHOLD 次失败才判定死亡；切换后有冷却期
+#   3. 进程上限     —— 并发数封顶、候选池截断、ulimit 限制单文件大小
+#   4. 单实例锁     —— mkdir 原子锁，杜绝多实例并发写 hosts
+#
+# 兼容 OpenWrt busybox ash，无 bash 依赖。外部依赖：curl（需要 --resolve）
+# ============================================================
+
+CONF=/etc/ghacc/ghacc.conf
+[ -f "$CONF" ] && . "$CONF"
+
+# ---------- 默认值（被 $CONF 覆盖）----------
+: "${DOMAINS:=github.com api.github.com codeload.github.com gist.github.com raw.githubusercontent.com gist.githubusercontent.com objects.githubusercontent.com avatars.githubusercontent.com}"
+: "${CHECK_INTERVAL:=15}"
+: "${PROBE_TIMEOUT:=3}"
+: "${MAX_IPS:=2}"
+: "${POOL_REFRESH:=600}"
+: "${LOG_FILE:=/var/log/ghacc.log}"
+: "${STATE_DIR:=/tmp/ghacc}"
+: "${HOSTS:=/etc/hosts}"
+: "${MAX_LOG:=200}"
+
+# ---- v2 资源保护参数 ----
+# ---- addn-hosts 输出（关键）----
+# 很多固件（QWRT / QSDK 等）的 dnsmasq 并不读 /etc/hosts，而是只认
+# `addn-hosts=` 指定的额外文件。实测：往 /etc/hosts 写测试条目后，
+# 即便重启 dnsmasq 也返回 NXDOMAIN。
+# 所以真正生效的输出是 ADDN_HOSTS 这个文件，它通过 DNSMASQ_CONFDIR 里的
+# drop-in 配置注册给 dnsmasq。
+: "${ADDN_HOSTS:=/tmp/ghacc/hosts.addn}"   # 留空=不写（退化为只写 /etc/hosts）
+: "${DNSMASQ_CONFDIR:=/tmp/dnsmasq.d}"     # dnsmasq 的 conf-dir，放 drop-in
+: "${WRITE_ETC_HOSTS:=1}"                  # 是否也写 /etc/hosts（兼容其他固件）
+
+: "${CONCURRENCY:=8}"          # 并发探测数（硬上限 16）
+: "${MAX_CANDIDATES:=24}"      # 每个域名最多探测多少个候选 IP
+: "${FAIL_THRESHOLD:=2}"       # 连续失败几次才认定该域名已死（抗瞬时抖动）
+: "${COOLDOWN:=120}"           # 同一域名切换后的冷却期（秒），期间不再重扫
+: "${MIN_WRITE_INTERVAL:=60}"  # 两次 hosts 写入的最小间隔（秒），保护 flash
+: "${CYCLE_GUARD:=300}"        # 单轮循环最长耗时（秒），超时强制进入下一轮
+
+# ---- v2.4 健康判据参数 ----
+# 详见 verify_ip() 的注释。这两个值的作用是挡掉"状态码看着正常、
+# 实际不是 GitHub"的假 IP（4 字节 OK / 400 Bad request 页）。
+: "${MIN_BODY_SIZE:=5000}"     # 正文体积下限（字节）；真 GitHub 首页约 29 万+
+: "${BODY_MARKER:=github}"     # 正文必须含有的特征串（不区分大小写）
+# DNS 自愈校验（B2）：问本机 dnsmasq 一个探针域名，确认它真的解析到了
+# 我们写入的 IP。用于发现"drop-in 文件在、但 dnsmasq 没加载"的静默失效。
+# 置空则关闭该校验。
+: "${SELFCHECK_DOMAIN:=github.com}"   # 用哪个受管域名做探针
+: "${SELFCHECK_INTERVAL:=300}"        # 两次自愈校验的最小间隔（秒），防止空耗
+: "${SELFCHECK_DNS:=127.0.0.1}"       # 问哪台 DNS（默认本机 dnsmasq）
+
+# ---- v2.4.2 日志自动清理 ----
+: "${AUTO_CLEAN_LOG_DAYS:=3}"   # 保留天数；0 = 关闭按天清理（仅受 MAX_LOG 限制）
+: "${TRIM_INTERVAL:=3600}"      # 清理检查的最小间隔（秒），防止频繁扫日志
+
+# ---- 候选 IP 来源与优先级（v2.4.4 调整）----
+#
+# 四个来源，按可信度排序。candidates() 会先放新鲜的、再放兜底的，
+# 因为最终要 head -n MAX_CANDIDATES 截断 —— 顺序即优先级：
+#
+#   1) POOL_CACHE     抓自 raw.hellogithub.com/hosts —— **GitHub520 项目持续维护**
+#                     （开源：github.com/521xueweihan/GitHub520，用 DNS+实测
+#                      生成 hosts，文件每次请求都是最新的）。这是主要来源。
+#   2) DOH_LIST      阿里 223.5.5.5 / 腾讯 1.12.12.12 的 DoH 接口，实时解析。
+#   3) FASTLY_POOL   githubusercontent.com 的 Fastly 段（4 个）
+#   4) GH_POOL       github.com 的常见 IP 段
+#
+# ⚠️ 关于 3) 和 4)：**这两个是写死的静态快照，无人维护、不会自动更新。**
+#    它们是 2026-10 从 GitHub520 抄来的一次性数据，仅供前两个来源全部失败时
+#    兜底（例如 DoH 被墙、GitHub520 拉不到）。随着时间推移会逐渐失效。
+#    **不要把它们当成可靠来源。** 想更新只能改这里，或在配置里覆盖
+#    GH_POOL / FASTLY_POOL 变量。
+#
+# 注意历史教训：早期版本把硬编码池与新鲜来源一起 sort -u 后截断，
+# 结果是 21 个陈旧 IP 挤占了 MAX_CANDIDATES(24) 的绝大部分名额，
+# 新鲜来源反而被截掉。现在改为「新鲜来源优先、兜底来源置后」。
+: "${GH_POOL:=140.82.112.3 140.82.112.4 140.82.112.17 140.82.112.18 140.82.112.22 140.82.112.26 140.82.113.3 140.82.113.4 140.82.113.17 140.82.113.22 140.82.114.3 140.82.114.4 140.82.114.17 140.82.114.22 140.82.116.3 140.82.116.4 20.205.243.165 20.205.243.166 20.205.243.168 20.27.177.113 20.27.177.119}"
+: "${FASTLY_POOL:=185.199.108.133 185.199.109.133 185.199.110.133 185.199.111.133}"
+: "${DOH_LIST:=https://223.5.5.5/resolve https://1.12.12.12/resolve}"
+: "${POOL_URL:=https://raw.hellogithub.com/hosts}"
+
+MARK_START="# GHACC-BEGIN"
+MARK_END="# GHACC-END"
+# 单实例锁默认放在状态目录（tmpfs，root 可写）；/var/run 不可写时自动回退
+: "${LOCK_DIR:=}"
+POOL_CACHE="$STATE_DIR/pool.txt"
+
+# ---------- 资源上限（进程级，防止任何异常放大）----------
+ulimit -c 0 2>/dev/null          # 不产生 core dump
+ulimit -f 4096 2>/dev/null       # 单文件最大 2MB，杜绝日志/临时文件失控
+[ "$CONCURRENCY" -gt 16 ] && CONCURRENCY=16
+
+mkdir -p "$STATE_DIR"
+
+# ---------- 单实例锁（防并发写 hosts）----------
+# 依次尝试：配置指定 → /var/run → 状态目录（tmpfs，root 可写）
+LOCKED=""
+for _cand in "$LOCK_DIR" /var/run/ghacc.lock "$STATE_DIR/ghacc.lock"; do
+    [ -n "$_cand" ] || continue
+    if mkdir "$_cand" 2>/dev/null; then
+        LOCKED="$_cand"
+        break
+    fi
+    # mkdir 失败：可能已存在（另一实例在跑）或目录不可写。
+    # 用 PID 判断持锁进程是否还活着，避免上次被 SIGKILL 留下僵尸锁导致永远起不来
+    [ -d "$_cand" ] || continue           # 建不了也不是目录 → 换下一个候选
+
+    # 锁已存在：读 PID 判断持有者是否还活着
+    _oldpid=$(cat "$_cand/pid" 2>/dev/null)
+    _alive=0
+    if [ -n "$_oldpid" ]; then
+        kill -0 "$_oldpid" 2>/dev/null && _alive=1
+        # 再确认它确实是本守护进程，防止 PID 复用导致误判
+        if [ "$_alive" -eq 1 ] && [ -r "/proc/$_oldpid/cmdline" ]; then
+            tr '\0' ' ' < "/proc/$_oldpid/cmdline" 2>/dev/null \
+                | grep -q "ghacc-daemon" || _alive=0
+        fi
+    fi
+    if [ "$_alive" -eq 0 ]; then
+        # 僵尸锁：原地接管（只改 pid，不删目录 —— 规避某些系统上 rmdir 受限的问题）
+        LOCKED="$_cand"
+        break
+    fi
+done
+
+if [ -z "$LOCKED" ]; then
+    printf '%s\n' "ghacc-daemon: 另一个实例正在运行，或无法创建锁目录，退出" >&2
+    exit 1
+fi
+LOCK_DIR="$LOCKED"
+printf '%s' "$$" > "$LOCK_DIR/pid" 2>/dev/null
+trap 'rm -f "$LOCK_DIR/pid" 2>/dev/null; rmdir "$LOCK_DIR" 2>/dev/null; exit 0' INT TERM EXIT
+
+log() {
+    printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null
+    if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt "$MAX_LOG" ]; then
+        tail -n $((MAX_LOG / 2)) "$LOG_FILE" > "$LOG_FILE.tmp" \
+            && mv "$LOG_FILE.tmp" "$LOG_FILE"
+    fi
+    trim_log_by_age
+}
+
+# 按天数清理日志（v2.4.2 新增，由 LuCI 的「自动清理日志」开关控制）。
+#
+# AUTO_CLEAN_LOG_DAYS=0 表示关闭（不按时间清理，只受 MAX_LOG 行数限制）。
+# 实现要点：
+#   · 节流为每 TRIM_INTERVAL 秒最多检查一次 —— 日志行是每次切换才写，
+#     没必要每行都跑一遍 sed。
+#   · 用 sed 按行首时间戳过滤，比 awk 逐行解析更快，且 busybox sed 支持。
+#   · 用「写临时文件再 mv」而非就地改，避免守护进程自己边写边读。
+#   · 保留最后 MAX_LOG 行作为兜底（防时间戳格式异常时误删全部）。
+trim_log_by_age() {
+    case "${AUTO_CLEAN_LOG_DAYS:-0}" in ''|*[!0-9]*) return 0 ;; esac
+    [ "${AUTO_CLEAN_LOG_DAYS}" -gt 0 ] || return 0
+    [ -f "$LOG_FILE" ] || return 0
+
+    _now=$(date +%s)
+    _last_trim=0
+    [ -f "$STATE_DIR/last_trim" ] && _last_trim=$(cat "$STATE_DIR/last_trim" 2>/dev/null)
+    case "$_last_trim" in ''|*[!0-9]*) _last_trim=0 ;; esac
+    [ $((_now - _last_trim)) -ge "${TRIM_INTERVAL:-3600}" ] || return 0
+    printf '%s' "$_now" > "$STATE_DIR/last_trim" 2>/dev/null
+
+    # 计算截止日期（YYYY-MM-DD）。
+    #
+    # 跨平台注意：不能用 `date -d '3 days ago'` —— 那是 GNU 专有语法，
+    # busybox date 与 macOS/BSD date 都不认（实测 busybox 会直接返回空，
+    # 导致整个清理逻辑静默失效）。这里改为「先用纯算术算出 epoch，
+    # 再让 date 解析 epoch」，三种实现各有可用写法，依次尝试：
+    #   1) -d "@<epoch>"   GNU date / busybox date
+    #   2) -r <epoch>      macOS / BSD date
+    #   3) -v-<n>d         macOS / BSD date（相对天数）
+    _cut_epoch=$((_now - AUTO_CLEAN_LOG_DAYS * 86400))
+    _cut=$(date -d "@$_cut_epoch" '+%F' 2>/dev/null)
+    [ -n "$_cut" ] || _cut=$(date -r "$_cut_epoch" '+%F' 2>/dev/null)
+    [ -n "$_cut" ] || _cut=$(date -v-"${AUTO_CLEAN_LOG_DAYS}"d '+%F' 2>/dev/null)
+    if [ -z "$_cut" ]; then
+        # 三种都不支持：跳过本轮（宁可不清理，也不能误删）
+        return 0
+    fi
+
+    # 保留空行与不符合时间戳格式的行（避免误删），只丢弃明确过期的。
+    #
+    # LC_ALL=C 是必需的：日志内容含中文（多字节），某些 awk（实测 macOS 的
+    # BSD awk）在 UTF-8 locale 下遇到多字节字符会报 "towc: multibyte
+    # conversion failure" 并**以非零退出**，导致整个清理被兜底逻辑放弃 ——
+    # 表现为"开了自动清理却永远不清"。置 C locale 后 awk 按字节处理，稳定。
+    # 区分两种「结果为空」：
+    #   ① awk 自身失败（非零退出）-> 保留原日志，绝不动
+    #   ② awk 成功但确实全部过期 -> 应当清空（这是正常结果，不是异常）
+    # 旧写法只判断 [ -s 临时文件 ]，会把 ② 也当成异常而放弃清理，
+    # 表现为"日志全过期了却一直不清"。
+    if LC_ALL=C awk -v cut="$_cut" '
+        {
+            d = substr($0, 1, 10)
+            if (d ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) {
+                if (d >= cut) print
+            } else {
+                print
+            }
+        }
+    ' "$LOG_FILE" > "$LOG_FILE.trim" 2>/dev/null; then
+        # awk 成功：无论结果是否为空都采用（空 = 确实全部过期）
+        mv -f "$LOG_FILE.trim" "$LOG_FILE" 2>/dev/null
+    else
+        # awk 失败：保留原日志
+        rm -f "$LOG_FILE.trim" 2>/dev/null
+    fi
+    return 0
+}
+
+# ---- 健康判据（v2.4.4 重写：按域名类型分级校验）----
+#
+# 历史教训：
+#   v2.3 及以前只判「HTTP 状态码 != 000」，会被冒牌服务器骗过
+#   （返回 200 但正文只有 4 字节 "OK"，浏览器打开只显示 OK）。
+#   v2.4 改成「2xx/3xx + 正文≥5000 + 含 github」，挡掉了冒牌 IP，
+#     **但引入了大面积误杀**：很多受管域名根本不是网页，
+#     访问根路径必然返回 404 或极短正文，与 IP 好坏无关：
+#       objects.githubusercontent.com  -> 404（只服务 /github-production-* 对象路径）
+#       avatars.githubusercontent.com  -> 302 + 41 字节
+#       api.github.com                 -> 200 但正文仅 2KB（REST API 的 JSON）
+#     于是这些域名被判"永久无可用 IP"，日志反复刷"已连续失败 N 次"。
+#
+# v2.4.4 的做法：**以 TLS 证书为准，不再依赖 HTTP 状态码与正文**。
+#   真实 GitHub 的证书由公共 CA（Sectigo/DigiCert）签发且 SAN 含该域名；
+#   冒牌 IP 要么证书链不可信、要么域名不匹配，curl 会直接失败。
+#   而 404/302/空正文都发生在 TLS 之后，不再影响判定 —— 根治误杀。
+#
+# curl 的判据（两者必须同时满足）：
+#   · 退出码 0            —— 连接成功且证书**链**校验通过
+#   · ssl_verify_result=0 —— 证书有效且**域名匹配**（含 SAN 检查）
+# 实测：真实 GitHub IP 两者均满足；路由器（CN=QWRT 自签）退出码 60、
+#       ssl_verify_result=18，被正确拒绝。
+#
+# 返回 0 = 该 IP 确实是这个域名；非 0 = 不可用
+verify_ip() {
+    _d="$1"; _ip="$2"
+
+    # 用 GET 而非 HEAD，并且只取第 1 个字节（-r 0-0）。
+    #
+    # 为什么不用 HEAD：实测 objects.githubusercontent.com 这类域名**不响应
+    # HEAD**（挂起直到超时），而 GET 立即返回 404。同一个 IP、同一时刻，
+    # HEAD 超时 / GET 0.4 秒返回 —— 用 HEAD 会把好 IP 判死。
+    # 用 -r 0-0 是为了既走 GET 语义、又不下载整个正文（很多域名正文很大）。
+    # 注意：即使返回 404/302 也无所谓 —— 我们只关心 TLS 层，
+    # 不看 HTTP 状态码（这正是 v2.4 误杀的根源）。
+    _sr=$(curl --noproxy '*' -s -r 0-0 -m "$PROBE_TIMEOUT" \
+          --resolve "$_d:443:$_ip" \
+          -o /dev/null -w '%{ssl_verify_result}' \
+          "https://$_d/" 2>/dev/null)
+    _rc=$?
+
+    # 退出码非 0：连不上、超时、或证书校验失败（60=证书问题）
+    [ "$_rc" -eq 0 ] || return 1
+
+    # ssl_verify_result 必须是 0（证书链可信 + 域名匹配）
+    case "$_sr" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$_sr" -eq 0 ] || return 1
+
+    # ---- 对 github.com 主站额外做正文校验 ----
+    # 主站是真正的网页，可以用体积与特征串再加一道保险，
+    # 防止「证书正常但返回错误页」的极端情况（如 400 Bad request 节点）。
+    # 其他域名跳过此项 —— 它们本来就不返回网页，强求必然误杀。
+    if [ "$_d" = "github.com" ] && [ "${STRICT_MAIN_SITE:-1}" = "1" ]; then
+        _body="$STATE_DIR/.verify.$$"
+        _r=$(curl --noproxy '*' -s -L -m "$PROBE_TIMEOUT" \
+             --resolve "$_d:443:$_ip" \
+             -o "$_body" -w '%{http_code} %{size_download}' \
+             "https://$_d/" 2>/dev/null)
+        _code=${_r%% *}
+        _size=${_r##* }
+        case "$_size" in ''|*[!0-9]*) _size=0 ;; esac
+
+        if [ "$_size" -lt "${MIN_BODY_SIZE}" ]; then
+            rm -f "$_body"; return 1
+        fi
+        case "$_code" in
+            2??|3??) ;;
+            *) rm -f "$_body"; return 1 ;;
+        esac
+        grep -qi "${BODY_MARKER}" "$_body" 2>/dev/null || { rm -f "$_body"; return 1; }
+        rm -f "$_body"
+    fi
+
+    return 0
+}
+
+probe() {
+    _d="$1"; _ip="$2"; _out="$3"
+    verify_ip "$_d" "$_ip" && printf '%s\n' "$_ip" >> "$_out"
+    return 0
+}
+
+candidates() {
+    _d="$1"
+
+    # ---- 第一梯队：新鲜来源（有维护者 / 实时解析）----
+    # 1) GitHub520 的缓存（持续维护，主要来源）
+    _fresh=""
+    [ -f "$POOL_CACHE" ] && \
+        _fresh=$(grep -E "[[:space:]]+$_d\$" "$POOL_CACHE" 2>/dev/null | awk '{print $1}')
+    # 2) DoH 实时解析
+    for _doh in $DOH_LIST; do
+        _ans=$(curl --noproxy '*' -s -m 5 "$_doh?name=$_d&type=A" 2>/dev/null \
+               | grep -o '"data":"[0-9.]*"' | cut -d'"' -f4)
+        _fresh="$_fresh $_ans"
+    done
+
+    # ---- 第二梯队：静态兜底池（无人维护，见上方注释）----
+    # 只有第一梯队全军覆没时才派上用场，因此放在后面 —— 这样 head -n
+    # 截断时优先保留新鲜 IP，不会被 21 个陈旧 IP 挤掉。
+    _fallback=""
+    case "$_d" in
+        *githubusercontent.com) _fallback="$FASTLY_POOL" ;;
+        *)                      _fallback="$GH_POOL" ;;
+    esac
+
+    # 先输出新鲜来源（去重后），再补兜底来源；两层各自去重，
+    # 保证兜底里的 IP 不会重复占用名额。
+    _fresh_uniq=$(printf '%s\n' $_fresh 2>/dev/null \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+    _fb_uniq=$(printf '%s\n' $_fallback 2>/dev/null \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
+
+    {
+        printf '%s\n' "$_fresh_uniq"
+        # 只补充不在新鲜集合里的兜底 IP
+        printf '%s\n' "$_fb_uniq" | grep -vxF "$_fresh_uniq" 2>/dev/null
+    } | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n "$MAX_CANDIDATES"
+}
+
+find_ips() {
+    _d="$1"
+    _out="$STATE_DIR/.probe.$$"
+    : > "$_out"
+    _i=0
+    for _ip in $(candidates "$_d"); do
+        probe "$_d" "$_ip" "$_out" &
+        _i=$((_i + 1))
+        [ $((_i % CONCURRENCY)) -eq 0 ] && wait
+    done
+    wait
+    head -n "$MAX_IPS" "$_out" 2>/dev/null
+    rm -f "$_out"
+}
+
+current_ok() {
+    _d="$1"; _sf="$STATE_DIR/ip.$_d"
+    [ -f "$_sf" ] || return 1
+    while read -r _ip; do
+        [ -n "$_ip" ] || continue
+        # v2.4：与 probe() 共用同一判据。旧版只判「非 000」，
+        # 会让 400 页 / 4 字节 OK 的假 IP 一直被认为"还活着"，永不触发重扫。
+        verify_ip "$_d" "$_ip" && return 0
+    done < "$_sf"
+    return 1
+}
+
+# 生成标记块内容（含时间戳注释）
+block_content() {
+    printf '%s\n' "$MARK_START"
+    printf '# ghacc-daemon @ %s\n' "$(date '+%F %T')"
+    for _d in $DOMAINS; do
+        _sf="$STATE_DIR/ip.$_d"
+        [ -f "$_sf" ] || continue
+        while read -r _ip; do
+            [ -n "$_ip" ] && printf '%-16s %s\n' "$_ip" "$_d"
+        done < "$_sf"
+    done
+    printf '%s\n' "$MARK_END"
+}
+
+# 原子替换 /etc/hosts：先写临时文件再 cp，中途被杀也不会留下半个文件
+#
+# 关键：除了摘掉自己的标记块，还要清掉块外面残留的同名条目。
+# 很多国内固件（QWRT 等）出厂就预置了 `20.205.243.166 github.com` 这类加速条目，
+# 它排在标记块之前，dnsmasq 会优先认它 —— 我们写进去的 IP 就被静默盖掉了。
+# 现象：日志显示"写入成功"，但 nslookup 返回的还是旧 IP。
+rebuild_hosts() {
+    _tmp=$(mktemp) || return 1
+    awk -v s="$MARK_START" -v e="$MARK_END" -v doms="$DOMAINS" '
+        BEGIN {
+            n = split(doms, d, " ")
+            for (i = 1; i <= n; i++) managed[d[i]] = 1
+        }
+        index($0, s) == 1 { inb = 1; next }
+        index($0, e) == 1 { inb = 0; next }
+        inb { next }
+        # 注释行、空行原样保留
+        $0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/ { print; next }
+        {
+            ip = $1
+            keep = ""
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /^#/) break          # 行尾注释之后不算主机名
+                if (!($i in managed)) keep = keep " " $i
+            }
+            if (keep != "") print ip keep      # 主机名全被接管了就整行丢弃
+        }
+    ' "$HOSTS" > "$_tmp" 2>/dev/null
+    [ -s "$_tmp" ] || { rm -f "$_tmp"; return 1; }
+
+    block_content >> "$_tmp" 2>/dev/null
+
+    cp -f "$_tmp" "$HOSTS" 2>/dev/null
+    rm -f "$_tmp"
+    return 0
+}
+
+# 写 addn-hosts 文件（dnsmasq 真正读的那个）。
+# 全程在 tmpfs 上，不消耗闪存；原子 mv 替换。
+write_addn() {
+    [ -n "$ADDN_HOSTS" ] || return 0
+    _dir=$(dirname "$ADDN_HOSTS" 2>/dev/null)
+    [ -n "$_dir" ] && mkdir -p "$_dir" 2>/dev/null
+    _t="${ADDN_HOSTS}.tmp.$$"
+    if block_content > "$_t" 2>/dev/null && mv -f "$_t" "$ADDN_HOSTS" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$_t" 2>/dev/null
+    return 1
+}
+
+# 在 dnsmasq 的 conf-dir 里放 drop-in，把 ADDN_HOSTS 注册成 addn-hosts。
+# 返回值：0=新建或有变更（需要重启 dnsmasq 才生效）
+#         2=已存在且内容一致（无需动作）
+#         1=失败
+ensure_dropin() {
+    [ -n "$DNSMASQ_CONFDIR" ] || return 2
+    [ -n "$ADDN_HOSTS" ] || return 2
+    mkdir -p "$DNSMASQ_CONFDIR" 2>/dev/null || return 1
+    _f="$DNSMASQ_CONFDIR/ghacc.conf"
+    _want="addn-hosts=$ADDN_HOSTS"
+    if [ -f "$_f" ] && [ "$(cat "$_f" 2>/dev/null)" = "$_want" ]; then
+        return 2
+    fi
+    printf '%s\n' "$_want" > "$_f" 2>/dev/null || return 1
+    return 0
+}
+
+# 期望的条目内容（只含 IP 行，不含标记行和时间戳，便于与提取结果比对）
+expected_entries() {
+    for _d in $DOMAINS; do
+        _sf="$STATE_DIR/ip.$_d"
+        [ -f "$_sf" ] || continue
+        while read -r _ip; do
+            [ -n "$_ip" ] && printf '%-16s %s\n' "$_ip" "$_d"
+        done < "$_sf"
+    done
+}
+
+# DNS 自愈校验（B2，v2.4 新增）：确认 dnsmasq 真的解析到了我们写入的 IP。
+#
+# 为什么需要它：旧版只检查「addn 文件在 + drop-in 文件在」，但这两者都只是
+# "看起来对"。若固件改了 conf-dir 的加载规则、drop-in 被别的东西覆盖、
+# 或 dnsmasq 重启后没再读该文件，文件依然齐全，而解析早就失效了 ——
+# 这正是本项目历史上反复踩的同一类坑（"内容对 ≠ 解析生效"）。
+#
+# 做法：拿一个受管域名去问本机 dnsmasq，看返回的地址是否落在我们写入的集合里。
+# 返回 0 = 一致；1 = 不一致（需要重建/重载）；2 = 无法判断（跳过，不误报）
+dns_in_sync() {
+    [ -n "$SELFCHECK_DOMAIN" ] || return 2
+    _sf="$STATE_DIR/ip.$SELFCHECK_DOMAIN"
+    [ -f "$_sf" ] || return 2                 # 该域名本轮还没选出 IP，不判断
+    _want=$(grep -v '^$' "$_sf" 2>/dev/null)
+    [ -n "$_want" ] || return 2
+
+    # 优先 nslookup，退化到 host；两者都不可用时放弃判断（返回 2，不误报）
+    #
+    # 解析格式注意：nslookup 的输出里既有 DNS 服务器地址也有答案，
+    # busybox 与 BSD 两种风格还不一样：
+    #   BSD:      Address: 140.82.114.4
+    #   busybox:  Address 1: 140.82.112.26
+    # 而且首部 `Address: 192.168.2.1#53` 是服务器地址，必须排除。
+    # 统一用「严格点分四段 IP」正则过滤，即可把服务器行（带 #53）和
+    # 各种前缀差异一并处理掉，不必分别适配两种风格。
+    if command -v nslookup >/dev/null 2>&1; then
+        _got=$(nslookup "$SELFCHECK_DOMAIN" "$SELFCHECK_DNS" 2>/dev/null \
+               | awk '/^Address/{print $NF}' \
+               | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u)
+    elif command -v host >/dev/null 2>&1; then
+        _got=$(host "$SELFCHECK_DOMAIN" "$SELFCHECK_DNS" 2>/dev/null \
+               | awk '/has address/{print $NF}' \
+               | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | sort -u)
+    else
+        return 2
+    fi
+    [ -n "$_got" ] || return 1                # 问不到任何地址 → 视为不一致
+
+    # 只要 dnsmasq 返回的地址里有一个是我们写的，就算生效
+    for _g in $_got; do
+        for _w in $_want; do
+            [ "$_g" = "$_w" ] && return 0
+        done
+    done
+    return 1
+}
+
+# hosts 是否还是"我们写进去的样子"，且 dnsmasq 是否真的在用它。
+# 某些固件会定时重建 /etc/hosts，把标记块冲掉；这里每轮比对，
+# 一旦不一致就自动补回（写入仍受 MIN_WRITE_INTERVAL 节流）。
+# 注意：两端都只比 IP 行。标记行是否存在由下面的 grep 单独判断，
+# 否则"提取时跳过标记行、期望里却含标记行"会导致永远比不上。
+hosts_in_sync() {
+    _exp=$(expected_entries 2>/dev/null)
+
+    # 1) addn-hosts 文件：这是 dnsmasq 真正读的，必须存在且内容一致
+    if [ -n "$ADDN_HOSTS" ]; then
+        [ -f "$ADDN_HOSTS" ] || return 1
+        grep -q "^${MARK_START}" "$ADDN_HOSTS" 2>/dev/null || return 1
+        _cur=$(grep -v '^#' "$ADDN_HOSTS" 2>/dev/null)
+        [ "$_cur" = "$_exp" ] || return 1
+        # drop-in 也得在，否则 dnsmasq 压根不知道有这个文件
+        if [ -n "$DNSMASQ_CONFDIR" ]; then
+            [ -f "$DNSMASQ_CONFDIR/ghacc.conf" ] || return 1
+        fi
+    fi
+
+    # 2) /etc/hosts：仅在开启写入时校验
+    if [ "$WRITE_ETC_HOSTS" = "1" ]; then
+        [ -f "$HOSTS" ] || return 1
+        grep -q "^${MARK_START}" "$HOSTS" 2>/dev/null || return 1
+        _cur2=$(awk -v s="$MARK_START" -v e="$MARK_END" '
+            index($0, e) == 1 { f = 0; next }
+            index($0, s) == 1 { f = 1; next }
+            f
+        ' "$HOSTS" 2>/dev/null | grep -v '^#')
+        [ "$_cur2" = "$_exp" ] || return 1
+    fi
+
+    # 3) DNS 自愈校验（B2）：节流执行，避免每轮都发起 DNS 查询
+    if [ -n "$SELFCHECK_DOMAIN" ]; then
+        _now_s=$(date +%s)
+        _last_s=0
+        [ -f "$STATE_DIR/selfcheck.ts" ] && _last_s=$(cat "$STATE_DIR/selfcheck.ts" 2>/dev/null)
+        case "$_last_s" in ''|*[!0-9]*) _last_s=0 ;; esac
+        if [ $((_now_s - _last_s)) -ge "${SELFCHECK_INTERVAL}" ]; then
+            printf '%s' "$_now_s" > "$STATE_DIR/selfcheck.ts"
+            dns_in_sync
+            case "$?" in
+                1) log "DNS 自愈校验失败: ${SELFCHECK_DOMAIN} 解析结果与写入的 IP 不符（将重建并重载）"
+                   return 1 ;;
+                *) : ;;
+            esac
+        fi
+    fi
+
+    return 0
+}
+
+# 热加载 dnsmasq：SIGHUP 让它重读 hosts，不中断现有连接。
+# 三级兜底，适配 dnsmasq / dnsmasq-full / 多实例（QSDK 常见）等各种情况：
+#   1) killall -HUP      —— 一次覆盖所有 dnsmasq 实例（优先，最省心）
+#   2) pid 文件          —— 逐个尝试常见路径
+#   3) init reload       —— 最后手段（某些固件会走完整重启）
+reload_dns() {
+    # 允许用户在配置里直接指定重载命令，优先级最高
+    if [ -n "${DNS_RELOAD_CMD:-}" ]; then
+        sh -c "$DNS_RELOAD_CMD" >/dev/null 2>&1 && return 0
+    fi
+
+    killall -HUP dnsmasq 2>/dev/null && return 0
+
+    for _pidf in ${DNSMASQ_PID:-} /var/run/dnsmasq.pid /run/dnsmasq.pid \
+                 /var/run/dnsmasq/dnsmasq.pid /tmp/dnsmasq.pid /var/run/dnsmasq.cfg01411c.pid; do
+        [ -n "$_pidf" ] || continue
+        [ -f "$_pidf" ] || continue
+        kill -HUP "$(cat "$_pidf" 2>/dev/null)" 2>/dev/null && return 0
+    done
+
+    /etc/init.d/dnsmasq reload >/dev/null 2>&1 && return 0
+    return 1
+}
+
+refresh_pool() {
+    curl --noproxy '*' -s -m 12 "$POOL_URL" 2>/dev/null \
+        | grep -oE '^[0-9]{1,3}(\.[0-9]{1,3}){3}[[:space:]]+[a-zA-Z0-9.-]+' \
+        > "$POOL_CACHE.tmp" 2>/dev/null
+    if [ -s "$POOL_CACHE.tmp" ]; then
+        mv "$POOL_CACHE.tmp" "$POOL_CACHE"
+        return 0
+    fi
+    rm -f "$POOL_CACHE.tmp"
+    return 1
+}
+
+# ---------------- 主循环 ----------------
+log "ghacc-daemon v2 启动 (interval=${CHECK_INTERVAL}s, cooldown=${COOLDOWN}s, max_ips=${MAX_IPS}, 并发=${CONCURRENCY})"
+
+# 启动自检：把环境信息写进日志。远程排错时这些是最常被问到的三项。
+if [ -L "$HOSTS" ]; then
+    log "hosts 文件: ${HOSTS} -> $(readlink "$HOSTS" 2>/dev/null) （符号链接，实际写到链接目标）"
+else
+    log "hosts 文件: ${HOSTS} （普通文件）"
+fi
+log "curl: $(curl --version 2>/dev/null | head -n 1 | cut -d' ' -f2)"
+_dnspid=$(pgrep dnsmasq 2>/dev/null | tr '\n' ' ')
+log "dnsmasq 进程: ${_dnspid:-未发现}"
+
+# 启动即注册 drop-in。首次运行需要一次 dnsmasq 完整重启才能生效，
+# 之后重启路由时由本守护进程在开机后自动重新注册。
+if [ -n "$ADDN_HOSTS" ]; then
+    log "addn-hosts: ${ADDN_HOSTS}（dnsmasq 实际读取的文件）"
+    ensure_dropin
+    case "$?" in
+        0) /etc/init.d/dnsmasq restart >/dev/null 2>&1 \
+               && log "已注册 drop-in ${DNSMASQ_CONFDIR}/ghacc.conf 并重启 dnsmasq" \
+               || log "警告: drop-in 已写入但 dnsmasq 重启失败" ;;
+        2) log "drop-in 已存在，无需重启 dnsmasq" ;;
+        *) log "警告: 无法写入 drop-in（检查 DNSMASQ_CONFDIR: ${DNSMASQ_CONFDIR}）" ;;
+    esac
+else
+    log "addn-hosts: 未启用（仅写 ${HOSTS}；若该固件不读 /etc/hosts 则不会生效）"
+fi
+
+[ -n "$POOL_URL" ] && refresh_pool && log "候选池已加载"
+
+_last_pool=0
+_last_write=0
+_warn_count=0
+
+while true; do
+    _cycle_start=$(date +%s)
+    _now=$_cycle_start
+
+    if [ $((_now - _last_pool)) -ge "$POOL_REFRESH" ]; then
+        refresh_pool && _last_pool=$_now
+    fi
+
+    for d in $DOMAINS; do
+        if current_ok "$d"; then
+            rm -f "$STATE_DIR/fail.$d"          # 活着就清空失败计数
+            continue
+        fi
+
+        # 不通：累计失败次数，达到阈值才认定死亡（抗瞬时抖动）
+        _fc=0
+        [ -f "$STATE_DIR/fail.$d" ] && _fc=$(cat "$STATE_DIR/fail.$d" 2>/dev/null)
+        _fc=$((_fc + 1))
+        printf '%s' "$_fc" > "$STATE_DIR/fail.$d"
+        [ "$_fc" -lt "$FAIL_THRESHOLD" ] && continue
+
+        # 冷却期保护：刚切换过的域名不再重扫，避免抖动风暴
+        _sw=0
+        [ -f "$STATE_DIR/last.$d" ] && _sw=$(cat "$STATE_DIR/last.$d" 2>/dev/null)
+        if [ $((_now - _sw)) -lt "$COOLDOWN" ]; then
+            continue
+        fi
+
+        newips=$(find_ips "$d")
+        if [ -n "$newips" ]; then
+            printf '%s\n' "$newips" > "$STATE_DIR/ip.$d"
+            printf '%s' "$_now" > "$STATE_DIR/last.$d"
+            rm -f "$STATE_DIR/fail.$d"
+            : > "$STATE_DIR/dirty"                  # 打脏标记，稍后统一落盘
+            log "切换 $d → $(printf '%s' "$newips" | tr '\n' ' ')"
+        else
+            # 告警节流：每 20 次才记一条，避免全封时日志刷屏
+            _warn_count=$((_warn_count + 1))
+            if [ $((_warn_count % 20)) -eq 1 ]; then
+                log "警告: $d 无可用 IP（已连续失败 $_fc 次，将持续重试）"
+            fi
+        fi
+    done
+
+    # 完整性校验：固件或其他程序把 hosts 改写/冲掉时自动补回。
+    # 只在"确实有 IP 可写"时才有意义，避免全封时空转刷日志。
+    if [ ! -f "$STATE_DIR/dirty" ]; then
+        _have=0
+        for _d in $DOMAINS; do
+            [ -f "$STATE_DIR/ip.$_d" ] && { _have=1; break; }
+        done
+        if [ "$_have" -eq 1 ] && ! hosts_in_sync; then
+            : > "$STATE_DIR/dirty"
+            log "检测到 hosts 被外部改写或条目缺失，将重建标记块"
+        fi
+    fi
+
+    # 脏标记 + 最小写入间隔 —— 这是保护 flash 的关键：
+    # 抖动时多个切换会被合并成一次写入，且写入频率有硬上限
+    if [ -f "$STATE_DIR/dirty" ]; then
+        if [ $((_now - _last_write)) -ge "$MIN_WRITE_INTERVAL" ]; then
+            # 先写 addn-hosts（dnsmasq 真正读的文件，在 tmpfs 上，零闪存消耗），
+            # 再按需写 /etc/hosts（兼容读 /etc/hosts 的固件，受节流保护）。
+            _ok=1
+            write_addn || _ok=0
+            if [ "$WRITE_ETC_HOSTS" = "1" ]; then
+                rebuild_hosts || _ok=0
+            fi
+
+            if [ "$_ok" -eq 1 ]; then
+                _last_write=$_now
+                rm -f "$STATE_DIR/dirty"
+
+                ensure_dropin
+                _dr=$?
+                if [ "$_dr" -eq 0 ]; then
+                    # drop-in 是新增/变更的：dnsmasq 的 conf-dir 只在启动时读取，
+                    # 必须完整重启一次才能生效（仅首次，之后走 SIGHUP 热加载）
+                    if /etc/init.d/dnsmasq restart >/dev/null 2>&1; then
+                        log "已注册 addn-hosts(${ADDN_HOSTS}) 并重启 dnsmasq"
+                    else
+                        log "警告: drop-in 已写入，但 dnsmasq 重启失败"
+                    fi
+                elif reload_dns; then
+                    log "已更新 ${ADDN_HOSTS} 并热加载 dnsmasq"
+                else
+                    log "警告: 文件已更新，但 dnsmasq 热加载失败（检查 DNS_RELOAD_CMD / DNSMASQ_PID）"
+                fi
+            else
+                log "警告: 写入失败（检查 ADDN_HOSTS / HOSTS 路径是否可写）"
+            fi
+        fi
+    fi
+
+    # 兜底：本轮耗时异常（curl 卡死等）时也不至于把循环拖死
+    _elapsed=$(($(date +%s) - _cycle_start))
+    if [ "$_elapsed" -gt "$CYCLE_GUARD" ]; then
+        log "警告: 本轮耗时 ${_elapsed}s 超过上限 ${CYCLE_GUARD}s"
+    fi
+
+    # 拆成 1 秒粒度：SIGTERM 能在 1 秒内被响应（整段 sleep 时信号要等它跑完才处理，
+    # 会导致 stop 时锁来不及清理，下次启动被误判为"已有实例在运行"）
+    _s=0
+    while [ "$_s" -lt "$CHECK_INTERVAL" ]; do
+        sleep 1
+        _s=$((_s + 1))
+    done
+done

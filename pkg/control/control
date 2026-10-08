@@ -1,0 +1,15 @@
+Package: ghacc
+Version: 2.4.4
+Depends: libc, curl, ca-certificates
+Source: https://github.com/sqchr888/luci-app-ghacc
+Section: net
+Architecture: all
+Maintainer: sqchr888 <sqchr888@users.noreply.github.com>
+License: MIT
+Title: GitHub Accelerator Daemon for OpenWrt
+Description:  OpenWrt 上的 GitHub 实时加速守护进程（含 LuCI 界面）。
+ 常驻运行，持续探测 GitHub 各域名的可用 IP，失效时自动热切换并热加载
+ dnsmasq，使整个局域网无需安装客户端即可访问 GitHub。
+ 通过 TLS 证书校验识别假 IP；写入 tmpfs 不磨损闪存；SIGHUP 热加载不断网。
+ 包含 LuCI 管理界面（服务 -> GitHub 加速）与一键卸载命令 ghacc-uninstall。
+ Architecture: all 表示纯 shell + Lua 实现、无预编译二进制，适用于任意架构。

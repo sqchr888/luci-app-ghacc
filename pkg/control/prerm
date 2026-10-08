@@ -1,0 +1,32 @@
+#!/bin/sh
+# 卸载前：停止服务 + 取消自启 + 摘掉 hosts 标记块
+# 注意：本脚本运行时文件还没被删除，所以能用 /etc/init.d/ghacc。
+# 后面还跟了一段兜底逻辑，防止 init 脚本失效（比如被误删）时 hosts 清不干净。
+
+# opkg 传参：升级时是 "upgrade"，卸载时是 "remove"
+_action="${1:-remove}"
+
+[ -x /etc/init.d/ghacc ] && {
+    /etc/init.d/ghacc stop >/dev/null 2>&1
+    # 升级场景不取消自启：万一升级在中途失败（例如 postrm 报 126），
+    # 服务还能在下一次开机或手动 start 时拉起来，不会永久失效。
+    [ "$_action" != "upgrade" ] && /etc/init.d/ghacc disable >/dev/null 2>&1
+}
+
+# ---- 兜底：直接摘标记块 ----
+for _h in /etc/hosts /tmp/ghacc/hosts.addn; do
+    [ -f "$_h" ] || continue
+    grep -q '^# GHACC-BEGIN' "$_h" 2>/dev/null || continue
+    _t=$(mktemp 2>/dev/null) || _t="/tmp/.ghacc.prerm.$$"
+    awk '
+        index($0, "# GHACC-BEGIN") == 1 { inb = 1; next }
+        index($0, "# GHACC-END")   == 1 { inb = 0; next }
+        !inb { print }
+    ' "$_h" > "$_t" 2>/dev/null
+    [ -s "$_t" ] && cp -f "$_t" "$_h" 2>/dev/null || : > "$_h" 2>/dev/null
+    rm -f "$_t"
+done
+
+killall -HUP dnsmasq 2>/dev/null
+[ -f /var/run/dnsmasq.pid ] && kill -HUP "$(cat /var/run/dnsmasq.pid)" 2>/dev/null
+exit 0

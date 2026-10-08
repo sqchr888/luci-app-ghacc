@@ -1,0 +1,10 @@
+#!/bin/sh
+# 安装后：注册开机自启并启动
+chmod +x /usr/bin/ghacc-daemon 2>/dev/null
+chmod +x /etc/init.d/ghacc 2>/dev/null
+mkdir -p /etc/ghacc 2>/dev/null
+/etc/init.d/ghacc enable >/dev/null 2>&1
+/etc/init.d/ghacc start >/dev/null 2>&1
+# 让 rpcd 重新加载 ACL，LuCI 菜单才会出现
+/etc/init.d/rpcd restart >/dev/null 2>&1
+exit 0

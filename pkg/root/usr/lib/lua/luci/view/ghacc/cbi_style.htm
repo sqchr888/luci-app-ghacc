@@ -1,0 +1,38 @@
+<style type="text/css">
+/* ghacc 参数设置页的输入框尺寸调整（v2.4.2）
+ *
+ * 为什么需要这个文件：
+ *   LuCI 主题（尤其 bootstrap 系）默认把 .cbi-input-text 设成 width:100%，
+ *   会让数值输入框横贯整个表单，视觉上很松散，也与左侧标签不对齐。
+ *   option.size 只设置 <input size="..."> 属性，会被主题的 CSS 宽度覆盖，
+ *   所以必须用 CSS 明确限宽。
+ *
+ * 选择器 #cbi-ghacc-main：
+ *   Map("ghacc") + NamedSection("main") 生成该 id，只作用于本页，
+ *   不会影响其他 LuCI 插件的表单。
+ */
+#cbi-ghacc-main .cbi-input-text {
+	width: 8em !important;
+	min-width: 8em;
+	max-width: 8em;
+	margin-left: 0;
+	text-align: left;
+}
+
+/* 多行文本域（守护域名）需要更宽，但给个上限，避免超宽屏下拉成一条线 */
+#cbi-ghacc-main textarea.cbi-input-textarea {
+	width: 90%;
+	max-width: 46em;
+	margin-left: 0;
+}
+
+/* 说明文字限宽，避免长句在宽屏上难以阅读 */
+#cbi-ghacc-main .cbi-value-description {
+	max-width: 52em;
+}
+
+/* 勾选框与数值框左边缘对齐（部分主题会给 input 额外一边距） */
+#cbi-ghacc-main .cbi-value-field {
+	margin-left: 0;
+}
+</style>
